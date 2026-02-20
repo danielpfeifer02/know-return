@@ -71,6 +71,7 @@ Environment knobs (override before sourcing):
 - `EXPLAIN_SEND_TIMEOUT_MS` client socket wait timeout in milliseconds (default 6000).
 - `EXPLAIN_LLM_MIN_INTERVAL_MS` minimum spacing between outbound LLM calls (default 800).
 - `EXPLAIN_LLM_CACHE_TTL_MS` dedupe cache TTL for repeated failures (default 45000).
+- `EXPLAIN_LLM_FAILURE_BACKOFF_MS` temporary cooldown after an LLM call fails (default 5000).
 - `EXPLAIN_SHELL` override shell detection in `scripts/explain_init.sh` (`bash` or `zsh`).
 
 ## OpenAI
@@ -81,6 +82,7 @@ LLM requests use the OpenAI Responses API (`POST /v1/responses`) with stable `in
 By default, non-zero exits are sent to the LLM unless the command output already appears self-explanatory (for example usage/help text).
 Prompt input is redacted before LLM calls to mask common secrets (tokens, API keys, URL credentials).
 Structured input includes command/exit/cwd/output plus compact runtime metadata (OS, distro, shell, repo/venv/container flags, and PATH summary).
+Client and daemon deadlines both account for the configured LLM timeout so long-running LLM calls do not prematurely time out.
 If daemon LLM config changes between shells (e.g. model/API key), the next request automatically rotates to a new daemon.
 Prompt instruction changes are part of daemon/client config hashing, so stale daemons are rotated automatically on the next failed command.
 When the OpenAI call fails, explainerr now returns heuristic fallback output instead of failing the send path.

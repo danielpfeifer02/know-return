@@ -56,6 +56,7 @@ const defaultSendDeadline = 6 * time.Second
 const defaultLLMTimeout = 4 * time.Second
 const defaultLLMMinInterval = 800 * time.Millisecond
 const defaultLLMCacheTTL = 45 * time.Second
+const defaultLLMFailureBackoff = 5 * time.Second
 const maxLLMCacheEntries = 256
 const runtimeConfigVersion = "3"
 const promptSchemaVersion = "1"
@@ -85,9 +86,10 @@ type cachedLLMResult struct {
 }
 
 var llmState = struct {
-	mu       sync.Mutex
-	lastCall time.Time
-	cache    map[string]cachedLLMResult
+	mu           sync.Mutex
+	lastCall     time.Time
+	failureUntil time.Time
+	cache        map[string]cachedLLMResult
 }{
 	cache: make(map[string]cachedLLMResult),
 }
@@ -429,7 +431,7 @@ func sendRequest(socket string, req Request) (*Response, error) {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
 	defer c.Close()
-	if err := c.SetDeadline(time.Now().Add(durationFromEnvMillis("EXPLAIN_SEND_TIMEOUT_MS", defaultSendDeadline))); err != nil {
+	if err := c.SetDeadline(time.Now().Add(clientConnDeadline())); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
@@ -481,6 +483,16 @@ func writeErr(w io.Writer, msg string) {
 	_ = json.NewEncoder(w).Encode(Response{Error: msg})
 }
 
+func clientConnDeadline() time.Duration {
+	sendTimeout := durationFromEnvMillis("EXPLAIN_SEND_TIMEOUT_MS", defaultSendDeadline)
+	llmTimeout := durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout)
+	minRequired := llmTimeout + 1500*time.Millisecond
+	if sendTimeout > minRequired {
+		return sendTimeout
+	}
+	return minRequired
+}
+
 func serverConnDeadline() time.Duration {
 	sendTimeout := durationFromEnvMillis("EXPLAIN_SEND_TIMEOUT_MS", defaultSendDeadline)
 	llmTimeout := durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout)
@@ -511,17 +523,22 @@ func explain(req Request) (string, bool, error) {
 	if cached, ok := loadCachedLLM(cacheKey); ok {
 		return cached, true, nil
 	}
+	if llmInFailureBackoff() {
+		return heur.Message, false, nil
+	}
 	if !allowLLMCallNow() {
 		return heur.Message, false, nil
 	}
 
 	llmMsg, err := llmCaller(key, req, heur)
 	if err != nil {
+		noteLLMFailure()
 		if isTruthy(os.Getenv("EXPLAIN_DEBUG")) {
 			fmt.Fprintf(os.Stderr, "[explainerr] LLM call failed: %v\n", err)
 		}
 		return heur.Message, false, nil
 	}
+	clearLLMFailureBackoff()
 	if isLowValueLLMMessage(llmMsg) {
 		return heur.Message, false, nil
 	}
@@ -592,6 +609,7 @@ func runtimeConfigParts(instructions string) []string {
 		"llm_timeout_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout).Milliseconds(), 10),
 		"llm_min_interval_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_MIN_INTERVAL_MS", defaultLLMMinInterval).Milliseconds(), 10),
 		"llm_cache_ttl_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_CACHE_TTL_MS", defaultLLMCacheTTL).Milliseconds(), 10),
+		"llm_failure_backoff_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_FAILURE_BACKOFF_MS", defaultLLMFailureBackoff).Milliseconds(), 10),
 	}
 }
 
@@ -681,6 +699,30 @@ func allowLLMCallNow() bool {
 	}
 	llmState.lastCall = now
 	return true
+}
+
+func llmInFailureBackoff() bool {
+	now := time.Now()
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+	return now.Before(llmState.failureUntil)
+}
+
+func noteLLMFailure() {
+	backoff := durationFromEnvMillis("EXPLAIN_LLM_FAILURE_BACKOFF_MS", defaultLLMFailureBackoff)
+	until := time.Now().Add(backoff)
+
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+	if until.After(llmState.failureUntil) {
+		llmState.failureUntil = until
+	}
+}
+
+func clearLLMFailureBackoff() {
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+	llmState.failureUntil = time.Time{}
 }
 
 type heuristicResult struct {
@@ -836,6 +878,10 @@ func durationFromEnvMillis(name string, fallback time.Duration) time.Duration {
 func sanitizeRequestForLLM(req Request) Request {
 	req.Command = redactSensitiveText(req.Command)
 	req.StdErr = redactSensitiveText(req.StdErr)
+	req.Cwd = cwdTail(req.Cwd, 2)
+	if shell := strings.TrimSpace(req.Shell); shell != "" {
+		req.Shell = filepath.Base(shell)
+	}
 	return req
 }
 

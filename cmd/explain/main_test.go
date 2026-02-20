@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+func resetLLMStateForTest() {
+	llmState.mu.Lock()
+	llmState.lastCall = time.Time{}
+	llmState.failureUntil = time.Time{}
+	llmState.cache = make(map[string]cachedLLMResult)
+	llmState.mu.Unlock()
+}
+
 func TestParseServeArgsDefaults(t *testing.T) {
 	cfg, err := parseServeArgs(nil)
 	if err != nil {
@@ -150,10 +158,7 @@ func TestExplainReturnsHeuristicWhenLLMCallFails(t *testing.T) {
 		llmCaller = origLLMCaller
 	})
 
-	llmState.mu.Lock()
-	llmState.lastCall = time.Time{}
-	llmState.cache = make(map[string]cachedLLMResult)
-	llmState.mu.Unlock()
+	resetLLMStateForTest()
 
 	req := Request{Command: "definitely-not-a-real-command", ExitCode: 127}
 	want := heuristic(req).Message
@@ -164,6 +169,70 @@ func TestExplainReturnsHeuristicWhenLLMCallFails(t *testing.T) {
 	}
 	if usedLLM {
 		t.Fatal("expected usedLLM=false when LLM call fails")
+	}
+	if msg != want {
+		t.Fatalf("message = %q, want heuristic fallback %q", msg, want)
+	}
+}
+
+func TestExplainSetsFailureBackoffOnLLMError(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("EXPLAIN_FORCE_LLM", "1")
+	t.Setenv("EXPLAIN_LLM_FAILURE_BACKOFF_MS", "1200")
+
+	origLLMCaller := llmCaller
+	llmCaller = func(string, Request, heuristicResult) (string, error) {
+		return "", errors.New("simulated LLM outage")
+	}
+	t.Cleanup(func() {
+		llmCaller = origLLMCaller
+	})
+	resetLLMStateForTest()
+
+	req := Request{Command: "definitely-not-a-real-command", ExitCode: 127}
+	_, _, err := explain(req)
+	if err != nil {
+		t.Fatalf("explain returned unexpected error: %v", err)
+	}
+
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+	if !llmState.failureUntil.After(time.Now()) {
+		t.Fatalf("expected failureUntil to be in the future, got %v", llmState.failureUntil)
+	}
+}
+
+func TestExplainSkipsLLMDuringFailureBackoff(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("EXPLAIN_FORCE_LLM", "1")
+
+	calls := 0
+	origLLMCaller := llmCaller
+	llmCaller = func(string, Request, heuristicResult) (string, error) {
+		calls++
+		return "'foo' - bad - run good", nil
+	}
+	t.Cleanup(func() {
+		llmCaller = origLLMCaller
+	})
+	resetLLMStateForTest()
+
+	llmState.mu.Lock()
+	llmState.failureUntil = time.Now().Add(2 * time.Second)
+	llmState.mu.Unlock()
+
+	req := Request{Command: "definitely-not-a-real-command", ExitCode: 127}
+	want := heuristic(req).Message
+
+	msg, usedLLM, err := explain(req)
+	if err != nil {
+		t.Fatalf("explain returned unexpected error: %v", err)
+	}
+	if usedLLM {
+		t.Fatal("expected usedLLM=false while in failure backoff")
+	}
+	if calls != 0 {
+		t.Fatalf("expected llmCaller to be skipped, calls=%d", calls)
 	}
 	if msg != want {
 		t.Fatalf("message = %q, want heuristic fallback %q", msg, want)
@@ -237,6 +306,28 @@ func TestServerConnDeadlineUsesSendTimeoutWhenLonger(t *testing.T) {
 	want := 9 * time.Second
 	if got != want {
 		t.Fatalf("serverConnDeadline = %v, want %v", got, want)
+	}
+}
+
+func TestClientConnDeadlineFollowsLLMTimeout(t *testing.T) {
+	t.Setenv("EXPLAIN_SEND_TIMEOUT_MS", "6000")
+	t.Setenv("EXPLAIN_LLM_TIMEOUT_MS", "9000")
+
+	got := clientConnDeadline()
+	want := 10500 * time.Millisecond
+	if got != want {
+		t.Fatalf("clientConnDeadline = %v, want %v", got, want)
+	}
+}
+
+func TestClientConnDeadlineUsesSendTimeoutWhenLonger(t *testing.T) {
+	t.Setenv("EXPLAIN_SEND_TIMEOUT_MS", "12000")
+	t.Setenv("EXPLAIN_LLM_TIMEOUT_MS", "4000")
+
+	got := clientConnDeadline()
+	want := 12 * time.Second
+	if got != want {
+		t.Fatalf("clientConnDeadline = %v, want %v", got, want)
 	}
 }
 
@@ -336,5 +427,25 @@ func TestResponsesInstructionsHasNoInventConstraint(t *testing.T) {
 	}
 	if !strings.Contains(responsesInstructions, "Output format") {
 		t.Fatal("expected instructions to include output format section")
+	}
+}
+
+func TestSanitizeRequestForLLMTrimsPathContext(t *testing.T) {
+	req := Request{
+		Command: "curl https://example.com",
+		StdErr:  "Authorization: Bearer secret-token",
+		Cwd:     "/home/dev/workspace/know-return",
+		Shell:   "/bin/bash",
+	}
+	sanitized := sanitizeRequestForLLM(req)
+
+	if sanitized.Cwd != "workspace/know-return" {
+		t.Fatalf("sanitized.Cwd = %q, want %q", sanitized.Cwd, "workspace/know-return")
+	}
+	if sanitized.Shell != "bash" {
+		t.Fatalf("sanitized.Shell = %q, want %q", sanitized.Shell, "bash")
+	}
+	if strings.Contains(sanitized.StdErr, "secret-token") {
+		t.Fatal("expected stderr token to be redacted")
 	}
 }
