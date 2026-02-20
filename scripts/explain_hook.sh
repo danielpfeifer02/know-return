@@ -8,6 +8,17 @@ EXPLAIN_LOG="${EXPLAIN_LOG:-/tmp/explainerr-stderr-$PPID.log}"
 EXPLAIN_MAX_BYTES="${EXPLAIN_MAX_BYTES:-4096}"
 EXPLAIN_IDLE_MINUTES="${EXPLAIN_IDLE_MINUTES:-30}"
 
+# DEBUG traps are only inherited into sourced scripts when functrace is enabled.
+# Bootstrap one re-source with functrace so we can preserve an existing DEBUG trap.
+if [[ -n "${BASH_VERSION:-}" && "${EXPLAIN_FTRACE_BOOTSTRAP:-0}" != "1" && "$-" != *T* ]]; then
+  set -o functrace
+  EXPLAIN_FTRACE_BOOTSTRAP=1 source "${BASH_SOURCE[0]}"
+  explain_bootstrap_rc=$?
+  set +o functrace
+  unset EXPLAIN_FTRACE_BOOTSTRAP
+  return "$explain_bootstrap_rc"
+fi
+
 if [[ -n "${EXPLAIN_HOOK_INSTALLED_BASH:-}" ]]; then
   return 0
 fi
@@ -102,6 +113,20 @@ explain_preexec() {
   EXPLAIN_CMD_START_MS=$(date +%s%3N 2>/dev/null || date +%s000)
 }
 
+explain_debug_trap_wrapper() {
+  if [[ "${EXPLAIN_IN_DEBUG_TRAP:-0}" == "1" ]]; then
+    return
+  fi
+  EXPLAIN_IN_DEBUG_TRAP=1
+
+  explain_preexec
+  if [[ -n "${EXPLAIN_PREV_DEBUG_TRAP:-}" ]]; then
+    builtin eval -- "$EXPLAIN_PREV_DEBUG_TRAP"
+  fi
+
+  EXPLAIN_IN_DEBUG_TRAP=0
+}
+
 explain_precmd() {
   local exit_code=$?
   EXPLAIN_IN_PROMPT=1
@@ -141,7 +166,30 @@ explain_precmd() {
 if [[ -n "${BASH_VERSION:-}" ]]; then
   EXPLAIN_HOOK_INSTALLED_BASH=1
   explain_maybe_start_daemon
-  trap 'explain_preexec' DEBUG
+
+  EXPLAIN_PREV_DEBUG_TRAP=""
+  explain_prev_trap_line=""
+  explain_prev_trap_file="/tmp/explainerr-prev-debug-trap-$$.txt"
+  trap -p DEBUG >"$explain_prev_trap_file" 2>/dev/null || true
+  if [[ -s "$explain_prev_trap_file" ]]; then
+    IFS= read -r explain_prev_trap_line <"$explain_prev_trap_file"
+  fi
+  if [[ -n "$explain_prev_trap_line" ]]; then
+    explain_prev_debug_candidate="${explain_prev_trap_line#trap -- \'}"
+    explain_prev_debug_candidate="${explain_prev_debug_candidate%\' DEBUG}"
+    if [[ "$explain_prev_debug_candidate" != "$explain_prev_trap_line" ]]; then
+      EXPLAIN_PREV_DEBUG_TRAP="$explain_prev_debug_candidate"
+    fi
+  fi
+  if [[ -n "$EXPLAIN_PREV_DEBUG_TRAP" ]]; then
+    if [[ "$EXPLAIN_PREV_DEBUG_TRAP" == "explain_debug_trap_wrapper" ]] || [[ "$EXPLAIN_PREV_DEBUG_TRAP" == "explain_preexec" ]]; then
+      EXPLAIN_PREV_DEBUG_TRAP=""
+    fi
+  fi
+  rm -f "$explain_prev_trap_file"
+  unset explain_prev_trap_line explain_prev_debug_candidate explain_prev_trap_file
+
+  trap 'explain_debug_trap_wrapper' DEBUG
   if declare -p PROMPT_COMMAND >/dev/null 2>&1 && [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == declare\ -a* ]]; then
     explain_has_precmd=0
     for explain_cmd in "${PROMPT_COMMAND[@]}"; do

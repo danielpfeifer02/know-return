@@ -24,6 +24,18 @@ source scripts/start_explain.fish
 
 This builds the binary, starts the daemon, and installs hooks in your current shell.
 
+For a full clean activation (rebuild + stale daemon/socket cleanup + hook reset), use:
+
+```bash
+source scripts/activate_explain.sh
+```
+
+For fish:
+
+```fish
+source scripts/activate_explain.fish
+```
+
 ## Shell hook setup (per shell session)
 
 ```bash
@@ -57,6 +69,8 @@ Environment knobs (override before sourcing):
 - `EXPLAIN_MODEL` OpenAI model for LLM fallback (default `gpt-4o-mini`).
 - `EXPLAIN_LLM_TIMEOUT_MS` LLM HTTP timeout in milliseconds (default 4000).
 - `EXPLAIN_SEND_TIMEOUT_MS` client socket wait timeout in milliseconds (default 6000).
+- `EXPLAIN_LLM_MIN_INTERVAL_MS` minimum spacing between outbound LLM calls (default 800).
+- `EXPLAIN_LLM_CACHE_TTL_MS` dedupe cache TTL for repeated failures (default 45000).
 - `EXPLAIN_SHELL` override shell detection in `scripts/explain_init.sh` (`bash` or `zsh`).
 
 ## OpenAI
@@ -65,6 +79,8 @@ Set `OPENAI_API_KEY` in your env to let the daemon use the LLM fallback. Without
 
 LLM requests use the OpenAI Responses API (`POST /v1/responses`).
 By default, non-zero exits are sent to the LLM unless the command output already appears self-explanatory (for example usage/help text).
+Prompt input is redacted before LLM calls to mask common secrets (tokens, API keys, URL credentials).
+If daemon LLM config changes between shells (e.g. model/API key), the next request automatically rotates to a new daemon.
 
 ## CLI usage
 

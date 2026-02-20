@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -114,6 +115,16 @@ func TestShouldUseLLMFalseForHelpCommand(t *testing.T) {
 	}
 }
 
+func TestShouldUseLLMTrueForShortHFlag(t *testing.T) {
+	req := Request{
+		Command:  `grep -h "foo" some-file.txt`,
+		ExitCode: 1,
+	}
+	if !shouldUseLLM(req, false) {
+		t.Fatal("expected -h command without usage output to use LLM")
+	}
+}
+
 func TestShouldUseLLMForceOverride(t *testing.T) {
 	req := Request{
 		Command:  `grep --help`,
@@ -122,5 +133,34 @@ func TestShouldUseLLMForceOverride(t *testing.T) {
 	}
 	if !shouldUseLLM(req, true) {
 		t.Fatal("expected force mode to use LLM")
+	}
+}
+
+func TestRedactSensitiveText(t *testing.T) {
+	input := `OPENAI_API_KEY=sk-secret-value Authorization: Bearer very-secret-token https://user:pass@example.com/path`
+	got := redactSensitiveText(input)
+	if got == input {
+		t.Fatal("expected sensitive content to be redacted")
+	}
+	if contains := "sk-secret-value"; strings.Contains(got, contains) {
+		t.Fatalf("expected %q to be redacted", contains)
+	}
+	if contains := "very-secret-token"; strings.Contains(got, contains) {
+		t.Fatalf("expected %q to be redacted", contains)
+	}
+	if strings.Contains(got, "user:pass@") {
+		t.Fatal("expected URL credentials to be redacted")
+	}
+}
+
+func TestRuntimeConfigHashChangesWithModel(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("EXPLAIN_MODEL", "gpt-4o-mini")
+	base := runtimeConfigHash()
+
+	t.Setenv("EXPLAIN_MODEL", "gpt-4.1-mini")
+	changed := runtimeConfigHash()
+	if base == changed {
+		t.Fatal("expected runtime config hash to change when model changes")
 	}
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,18 +18,20 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // Request is sent from shell hook to daemon.
 type Request struct {
-	Command   string `json:"cmd"`
-	ExitCode  int    `json:"exit_code"`
-	StdErr    string `json:"stderr"`
-	Cwd       string `json:"cwd"`
-	Duration  int64  `json:"duration_ms"`
-	Timestamp int64  `json:"ts"`
+	Command          string `json:"cmd"`
+	ExitCode         int    `json:"exit_code"`
+	StdErr           string `json:"stderr"`
+	Cwd              string `json:"cwd"`
+	Duration         int64  `json:"duration_ms"`
+	Timestamp        int64  `json:"ts"`
+	ClientConfigHash string `json:"cfg_hash,omitempty"`
 }
 
 // Response is returned by daemon to shell hook.
@@ -41,6 +45,49 @@ const defaultSocket = "/tmp/explainerr.sock"
 const defaultModel = "gpt-4o-mini"
 const defaultSendDeadline = 6 * time.Second
 const defaultLLMTimeout = 4 * time.Second
+const defaultLLMMinInterval = 800 * time.Millisecond
+const defaultLLMCacheTTL = 45 * time.Second
+const maxLLMCacheEntries = 256
+const runtimeConfigVersion = "2"
+
+type cachedLLMResult struct {
+	message   string
+	expiresAt time.Time
+}
+
+var llmState = struct {
+	mu       sync.Mutex
+	lastCall time.Time
+	cache    map[string]cachedLLMResult
+}{
+	cache: make(map[string]cachedLLMResult),
+}
+
+var sensitivePatterns = []struct {
+	pattern *regexp.Regexp
+	replace string
+}{
+	{
+		pattern: regexp.MustCompile(`(?i)\b(authorization\s*:\s*bearer)\s+[^\s"']+`),
+		replace: `$1 [REDACTED]`,
+	},
+	{
+		pattern: regexp.MustCompile(`(?i)\b(bearer)\s+[a-z0-9._-]{10,}`),
+		replace: `$1 [REDACTED]`,
+	},
+	{
+		pattern: regexp.MustCompile(`(?i)\b([a-z_][a-z0-9_]*(?:api[_-]?key|token|secret|password|passwd)[a-z0-9_]*)\s*=\s*([^\s"']+)`),
+		replace: `$1=[REDACTED]`,
+	},
+	{
+		pattern: regexp.MustCompile(`sk-[a-zA-Z0-9_-]{10,}`),
+		replace: `[REDACTED_KEY]`,
+	},
+	{
+		pattern: regexp.MustCompile(`([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@`),
+		replace: `$1[REDACTED]:[REDACTED]@`,
+	},
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -211,12 +258,13 @@ func runSend(args []string) {
 	fs.Parse(args)
 
 	req := Request{
-		Command:   *cmdLine,
-		ExitCode:  *exitCode,
-		StdErr:    *stderr,
-		Cwd:       *cwd,
-		Duration:  *duration,
-		Timestamp: time.Now().Unix(),
+		Command:          *cmdLine,
+		ExitCode:         *exitCode,
+		StdErr:           *stderr,
+		Cwd:              *cwd,
+		Duration:         *duration,
+		Timestamp:        time.Now().Unix(),
+		ClientConfigHash: runtimeConfigHash(),
 	}
 
 	resp, err := sendRequest(*socket, req)
@@ -262,8 +310,15 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
+	if req.ClientConfigHash != "" && req.ClientConfigHash != runtimeConfigHash() {
+		writeErr(conn, "daemon config mismatch")
+		return
+	}
+
+	redactedReq := sanitizeRequestForLLM(req)
+
 	if isTruthy(os.Getenv("EXPLAIN_DEBUG")) {
-		fmt.Fprintf(os.Stderr, "[explainerr] request: %+v\n", req)
+		fmt.Fprintf(os.Stderr, "[explainerr] request: %+v\n", redactedReq)
 	}
 
 	msg, usedLLM, err := explain(req)
@@ -294,6 +349,14 @@ func explain(req Request) (string, bool, error) {
 		return heur.Message + " (LLM disabled: set OPENAI_API_KEY)", false, nil
 	}
 
+	cacheKey := llmCacheKey(req)
+	if cached, ok := loadCachedLLM(cacheKey); ok {
+		return cached, true, nil
+	}
+	if !allowLLMCallNow() {
+		return heur.Message, false, nil
+	}
+
 	llmMsg, err := callLLM(key, req, heur)
 	if err != nil {
 		return heur.Message + " (LLM error: " + err.Error() + ")", false, err
@@ -301,6 +364,7 @@ func explain(req Request) (string, bool, error) {
 	if isLowValueLLMMessage(llmMsg) {
 		return heur.Message, false, nil
 	}
+	storeCachedLLM(cacheKey, llmMsg)
 	return llmMsg, true, nil
 }
 
@@ -315,8 +379,7 @@ func shouldUseLLM(req Request, forceLLM bool) bool {
 }
 
 func isSelfExplainedByOutput(req Request) bool {
-	cmd := " " + strings.ToLower(strings.TrimSpace(req.Command)) + " "
-	if strings.Contains(cmd, " --help ") || strings.Contains(cmd, " -h ") {
+	if hasCommandToken(req.Command, "--help") {
 		return true
 	}
 
@@ -334,6 +397,108 @@ func isSelfExplainedByOutput(req Request) bool {
 		return true
 	}
 	return false
+}
+
+func hasCommandToken(command, token string) bool {
+	parts := strings.Fields(command)
+	for _, part := range parts {
+		if part == token || strings.HasPrefix(part, token+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeConfigHash() string {
+	h := sha256.New()
+	parts := []string{
+		"version=" + runtimeConfigVersion,
+		"openai_api_key=" + os.Getenv("OPENAI_API_KEY"),
+		"force_llm=" + os.Getenv("EXPLAIN_FORCE_LLM"),
+		"mock_llm=" + os.Getenv("EXPLAIN_MOCK_LLM"),
+		"model=" + effectiveModel(),
+		"llm_timeout_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout).Milliseconds(), 10),
+		"llm_min_interval_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_MIN_INTERVAL_MS", defaultLLMMinInterval).Milliseconds(), 10),
+		"llm_cache_ttl_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_CACHE_TTL_MS", defaultLLMCacheTTL).Milliseconds(), 10),
+	}
+	for _, part := range parts {
+		_, _ = io.WriteString(h, part)
+		_, _ = io.WriteString(h, "\n")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func effectiveModel() string {
+	model := strings.TrimSpace(os.Getenv("EXPLAIN_MODEL"))
+	if model == "" {
+		return defaultModel
+	}
+	return model
+}
+
+func llmCacheKey(req Request) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, strconv.Itoa(req.ExitCode))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strings.TrimSpace(req.Command))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, truncate(strings.TrimSpace(req.StdErr), 4096))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func loadCachedLLM(key string) (string, bool) {
+	now := time.Now()
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+
+	for k, entry := range llmState.cache {
+		if now.After(entry.expiresAt) {
+			delete(llmState.cache, k)
+		}
+	}
+
+	entry, ok := llmState.cache[key]
+	if !ok || now.After(entry.expiresAt) {
+		return "", false
+	}
+	return entry.message, true
+}
+
+func storeCachedLLM(key, message string) {
+	now := time.Now()
+	ttl := durationFromEnvMillis("EXPLAIN_LLM_CACHE_TTL_MS", defaultLLMCacheTTL)
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+
+	for k, entry := range llmState.cache {
+		if now.After(entry.expiresAt) {
+			delete(llmState.cache, k)
+		}
+	}
+	if len(llmState.cache) >= maxLLMCacheEntries {
+		for k := range llmState.cache {
+			delete(llmState.cache, k)
+			break
+		}
+	}
+
+	llmState.cache[key] = cachedLLMResult{
+		message:   message,
+		expiresAt: now.Add(ttl),
+	}
+}
+
+func allowLLMCallNow() bool {
+	now := time.Now()
+	minInterval := durationFromEnvMillis("EXPLAIN_LLM_MIN_INTERVAL_MS", defaultLLMMinInterval)
+
+	llmState.mu.Lock()
+	defer llmState.mu.Unlock()
+	if now.Sub(llmState.lastCall) < minInterval {
+		return false
+	}
+	llmState.lastCall = now
+	return true
 }
 
 type heuristicResult struct {
@@ -413,24 +578,21 @@ func heuristic(req Request) heuristicResult {
 
 // callLLM sends a short prompt to OpenAI if available.
 func callLLM(apiKey string, req Request, heur heuristicResult) (string, error) {
+	safeReq := sanitizeRequestForLLM(req)
+
 	// Optional mock path for offline/testing environments.
 	if isTruthy(os.Getenv("EXPLAIN_MOCK_LLM")) {
-		return mockLLM(req, heur), nil
+		return mockLLM(safeReq, heur), nil
 	}
 
-	prompt := buildPrompt(req, heur)
+	prompt := buildPrompt(safeReq, heur)
 
 	if isTruthy(os.Getenv("EXPLAIN_DEBUG")) {
 		fmt.Fprintf(os.Stderr, "[explainerr] LLM prompt:\n%s\n", prompt)
 	}
 
-	model := strings.TrimSpace(os.Getenv("EXPLAIN_MODEL"))
-	if model == "" {
-		model = defaultModel
-	}
-
 	payload := responsesRequest{
-		Model:           model,
+		Model:           effectiveModel(),
 		Input:           prompt,
 		MaxOutputTokens: 120,
 		Temperature:     0.2,
@@ -485,6 +647,20 @@ func durationFromEnvMillis(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func sanitizeRequestForLLM(req Request) Request {
+	req.Command = redactSensitiveText(req.Command)
+	req.StdErr = redactSensitiveText(req.StdErr)
+	return req
+}
+
+func redactSensitiveText(input string) string {
+	redacted := input
+	for _, entry := range sensitivePatterns {
+		redacted = entry.pattern.ReplaceAllString(redacted, entry.replace)
+	}
+	return redacted
 }
 
 func extractResponseText(resp responsesResponse) string {
