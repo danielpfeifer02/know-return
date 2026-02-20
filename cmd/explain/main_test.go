@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseServeArgsDefaults(t *testing.T) {
@@ -136,6 +138,38 @@ func TestShouldUseLLMForceOverride(t *testing.T) {
 	}
 }
 
+func TestExplainReturnsHeuristicWhenLLMCallFails(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("EXPLAIN_FORCE_LLM", "1")
+
+	origLLMCaller := llmCaller
+	llmCaller = func(string, Request, heuristicResult) (string, error) {
+		return "", errors.New("simulated LLM outage")
+	}
+	t.Cleanup(func() {
+		llmCaller = origLLMCaller
+	})
+
+	llmState.mu.Lock()
+	llmState.lastCall = time.Time{}
+	llmState.cache = make(map[string]cachedLLMResult)
+	llmState.mu.Unlock()
+
+	req := Request{Command: "definitely-not-a-real-command", ExitCode: 127}
+	want := heuristic(req).Message
+
+	msg, usedLLM, err := explain(req)
+	if err != nil {
+		t.Fatalf("explain returned unexpected error: %v", err)
+	}
+	if usedLLM {
+		t.Fatal("expected usedLLM=false when LLM call fails")
+	}
+	if msg != want {
+		t.Fatalf("message = %q, want heuristic fallback %q", msg, want)
+	}
+}
+
 func TestRedactSensitiveText(t *testing.T) {
 	input := `OPENAI_API_KEY=sk-secret-value Authorization: Bearer very-secret-token https://user:pass@example.com/path`
 	got := redactSensitiveText(input)
@@ -162,5 +196,145 @@ func TestRuntimeConfigHashChangesWithModel(t *testing.T) {
 	changed := runtimeConfigHash()
 	if base == changed {
 		t.Fatal("expected runtime config hash to change when model changes")
+	}
+}
+
+func TestRuntimeConfigPartsChangeWithInstructions(t *testing.T) {
+	partsA := runtimeConfigParts("instruction-set-a")
+	partsB := runtimeConfigParts("instruction-set-b")
+	if strings.Join(partsA, "\n") == strings.Join(partsB, "\n") {
+		t.Fatal("expected runtime config parts to change when instructions change")
+	}
+
+	foundSchema := false
+	for _, part := range partsA {
+		if strings.HasPrefix(part, "prompt_schema_version=") {
+			foundSchema = true
+			break
+		}
+	}
+	if !foundSchema {
+		t.Fatal("expected prompt schema version to be part of runtime config")
+	}
+}
+
+func TestServerConnDeadlineFollowsLLMTimeout(t *testing.T) {
+	t.Setenv("EXPLAIN_SEND_TIMEOUT_MS", "6000")
+	t.Setenv("EXPLAIN_LLM_TIMEOUT_MS", "9000")
+
+	got := serverConnDeadline()
+	want := 10 * time.Second
+	if got != want {
+		t.Fatalf("serverConnDeadline = %v, want %v", got, want)
+	}
+}
+
+func TestServerConnDeadlineUsesSendTimeoutWhenLonger(t *testing.T) {
+	t.Setenv("EXPLAIN_SEND_TIMEOUT_MS", "9000")
+	t.Setenv("EXPLAIN_LLM_TIMEOUT_MS", "4000")
+
+	got := serverConnDeadline()
+	want := 9 * time.Second
+	if got != want {
+		t.Fatalf("serverConnDeadline = %v, want %v", got, want)
+	}
+}
+
+func TestBuildPromptStructuredJSON(t *testing.T) {
+	req := Request{
+		Command:       "  cleaqr  ",
+		ExitCode:      127,
+		Cwd:           "/home/dev/workspace/know-return",
+		StdErr:        "bash: cleaqr: command not found",
+		OS:            "linux/amd64",
+		Distro:        "Ubuntu 24.04 LTS",
+		Shell:         "/bin/bash",
+		InRepo:        true,
+		InVenv:        false,
+		InContainer:   false,
+		PathEntries:   8,
+		PathHasUsrBin: true,
+	}
+	heur := heuristicResult{Message: "Command not found: check PATH or install the binary."}
+
+	prompt := buildPrompt(req, heur)
+	const prefix = "INPUT_JSON:\n"
+	if !strings.HasPrefix(prompt, prefix) {
+		t.Fatalf("prompt missing INPUT_JSON prefix: %q", prompt)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(prompt, prefix)), &payload); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+
+	if got := payload["command"]; got != "cleaqr" {
+		t.Fatalf("command = %#v, want %q", got, "cleaqr")
+	}
+	if got := payload["cwd"]; got != "workspace/know-return" {
+		t.Fatalf("cwd = %#v, want %q", got, "workspace/know-return")
+	}
+	if got := payload["output_error"]; got != "bash: cleaqr: command not found" {
+		t.Fatalf("output_error = %#v, want exact stderr", got)
+	}
+	if got := payload["heuristic_hint"]; got != heur.Message {
+		t.Fatalf("heuristic_hint = %#v, want %q", got, heur.Message)
+	}
+
+	env, ok := payload["environment"].(map[string]any)
+	if !ok {
+		t.Fatalf("environment has wrong type: %T", payload["environment"])
+	}
+	if got := env["shell"]; got != "/bin/bash" {
+		t.Fatalf("environment.shell = %#v, want %q", got, "/bin/bash")
+	}
+	if got := env["in_repo"]; got != true {
+		t.Fatalf("environment.in_repo = %#v, want true", got)
+	}
+	if got := env["path_has_usr_bin"]; got != true {
+		t.Fatalf("environment.path_has_usr_bin = %#v, want true", got)
+	}
+}
+
+func TestBuildPromptEmptyOutputError(t *testing.T) {
+	prompt := buildPrompt(Request{Command: "false", ExitCode: 1}, heuristicResult{})
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(prompt, "INPUT_JSON:\n")), &payload); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
+	}
+	if got := payload["output_error"]; got != "<empty>" {
+		t.Fatalf("output_error = %#v, want %q", got, "<empty>")
+	}
+}
+
+func TestCwdTail(t *testing.T) {
+	if got := cwdTail("/home/dev/workspace/know-return", 2); got != "workspace/know-return" {
+		t.Fatalf("cwdTail = %q, want %q", got, "workspace/know-return")
+	}
+	if got := cwdTail("know-return", 2); got != "know-return" {
+		t.Fatalf("cwdTail short path = %q, want %q", got, "know-return")
+	}
+	if got := cwdTail("", 2); got != "" {
+		t.Fatalf("cwdTail empty = %q, want empty", got)
+	}
+}
+
+func TestPathSummary(t *testing.T) {
+	entries, hasUsrBin := pathSummary("/usr/local/bin:/usr/bin::/bin")
+	if entries != 3 {
+		t.Fatalf("entries = %d, want 3", entries)
+	}
+	if !hasUsrBin {
+		t.Fatal("expected /usr/bin to be detected")
+	}
+}
+
+func TestResponsesInstructionsHasNoInventConstraint(t *testing.T) {
+	if !strings.Contains(responsesInstructions, "Do not invent package names") {
+		t.Fatal("expected instructions to include do-not-invent constraint")
+	}
+	if !strings.Contains(responsesInstructions, "Output format") {
+		t.Fatal("expected instructions to include output format section")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,14 @@ type Request struct {
 	ExitCode         int    `json:"exit_code"`
 	StdErr           string `json:"stderr"`
 	Cwd              string `json:"cwd"`
+	OS               string `json:"os"`
+	Distro           string `json:"distro"`
+	Shell            string `json:"shell"`
+	InRepo           bool   `json:"in_repo"`
+	InVenv           bool   `json:"in_venv"`
+	InContainer      bool   `json:"in_container"`
+	PathEntries      int    `json:"path_entries"`
+	PathHasUsrBin    bool   `json:"path_has_usr_bin"`
 	Duration         int64  `json:"duration_ms"`
 	Timestamp        int64  `json:"ts"`
 	ClientConfigHash string `json:"cfg_hash,omitempty"`
@@ -48,7 +57,27 @@ const defaultLLMTimeout = 4 * time.Second
 const defaultLLMMinInterval = 800 * time.Millisecond
 const defaultLLMCacheTTL = 45 * time.Second
 const maxLLMCacheEntries = 256
-const runtimeConfigVersion = "2"
+const runtimeConfigVersion = "3"
+const promptSchemaVersion = "1"
+const responsesInstructions = `You are a terminal error explainer.
+
+Task:
+Given a command invocation and its stderr/output, produce ONE single-line suggestion.
+
+Rules (follow in order):
+1) Use only evidence from the provided output/error and metadata. Do not invent package names, flags, paths, or tools.
+2) Understand the command itself and combine command intent with exit code/output signals (e.g., typo, host not found) to infer the most likely issue.
+3) Be concise when you suggest a solution. Isolate e.g. wrong words or misused flags directly instead of only mentioning them as a cause.
+4) Choose the single most likely cause and the single best next action.
+5) If the output names a package manager or package that provides the command, prefer that exact install command/name.
+6) Otherwise keep the advice OS-agnostic (e.g., "install the package that provides <binary>" / "check PATH").
+
+Output format (exactly one line, nothing else):
+'<command>' - <brief cause> - <brief explanation/hint>
+
+Constraints:
+- Keep the entire line concise: target 15-20 words total, if needed can be more but never exceed 30 words.
+- No backticks, no extra punctuation beyond what the format implies.`
 
 type cachedLLMResult struct {
 	message   string
@@ -62,6 +91,8 @@ var llmState = struct {
 }{
 	cache: make(map[string]cachedLLMResult),
 }
+
+var llmCaller = callLLM
 
 var sensitivePatterns = []struct {
 	pattern *regexp.Regexp
@@ -118,8 +149,20 @@ type serveConfig struct {
 	idleMinutes int
 }
 
+type runtimeContext struct {
+	OS            string
+	Distro        string
+	Shell         string
+	InRepo        bool
+	InVenv        bool
+	InContainer   bool
+	PathEntries   int
+	PathHasUsrBin bool
+}
+
 type responsesRequest struct {
 	Model           string  `json:"model"`
+	Instructions    string  `json:"instructions,omitempty"`
 	Input           string  `json:"input"`
 	MaxOutputTokens int     `json:"max_output_tokens"`
 	Temperature     float64 `json:"temperature"`
@@ -257,11 +300,21 @@ func runSend(args []string) {
 	duration := fs.Int64("duration", 0, "duration ms")
 	fs.Parse(args)
 
+	ctx := detectRuntimeContext(*cwd)
+
 	req := Request{
 		Command:          *cmdLine,
 		ExitCode:         *exitCode,
 		StdErr:           *stderr,
 		Cwd:              *cwd,
+		OS:               ctx.OS,
+		Distro:           ctx.Distro,
+		Shell:            ctx.Shell,
+		InRepo:           ctx.InRepo,
+		InVenv:           ctx.InVenv,
+		InContainer:      ctx.InContainer,
+		PathEntries:      ctx.PathEntries,
+		PathHasUsrBin:    ctx.PathHasUsrBin,
 		Duration:         *duration,
 		Timestamp:        time.Now().Unix(),
 		ClientConfigHash: runtimeConfigHash(),
@@ -273,6 +326,101 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println(maybeColor(resp.Message))
+}
+
+func detectRuntimeContext(cwd string) runtimeContext {
+	resolvedCwd := strings.TrimSpace(cwd)
+	if resolvedCwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			resolvedCwd = wd
+		}
+	}
+
+	pathEntries, pathHasUsrBin := pathSummary(os.Getenv("PATH"))
+	return runtimeContext{
+		OS:            runtime.GOOS + "/" + runtime.GOARCH,
+		Distro:        detectDistro(),
+		Shell:         strings.TrimSpace(os.Getenv("SHELL")),
+		InRepo:        isInsideRepo(resolvedCwd),
+		InVenv:        inVirtualEnv(),
+		InContainer:   inContainer(),
+		PathEntries:   pathEntries,
+		PathHasUsrBin: pathHasUsrBin,
+	}
+}
+
+func detectDistro() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "PRETTY_NAME=") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "PRETTY_NAME=")
+		value = strings.Trim(value, `"'`)
+		return value
+	}
+	return ""
+}
+
+func inVirtualEnv() bool {
+	return strings.TrimSpace(os.Getenv("VIRTUAL_ENV")) != "" || strings.TrimSpace(os.Getenv("CONDA_PREFIX")) != ""
+}
+
+func inContainer() bool {
+	if strings.TrimSpace(os.Getenv("container")) != "" {
+		return true
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	data, err := os.ReadFile("/proc/1/cgroup")
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(data))
+	return strings.Contains(text, "docker") || strings.Contains(text, "kubepods") || strings.Contains(text, "containerd")
+}
+
+func isInsideRepo(cwd string) bool {
+	dir := strings.TrimSpace(cwd)
+	if dir == "" {
+		return false
+	}
+	dir = filepath.Clean(dir)
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return true
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return false
+}
+
+func pathSummary(pathEnv string) (entries int, hasUsrBin bool) {
+	for _, item := range filepath.SplitList(pathEnv) {
+		part := strings.TrimSpace(item)
+		if part == "" {
+			continue
+		}
+		entries++
+		if part == "/usr/bin" {
+			hasUsrBin = true
+		}
+	}
+	return entries, hasUsrBin
 }
 
 func sendRequest(socket string, req Request) (*Response, error) {
@@ -301,7 +449,7 @@ func sendRequest(socket string, req Request) (*Response, error) {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(serverConnDeadline()))
 
 	dec := json.NewDecoder(bufio.NewReader(conn))
 	var req Request
@@ -333,6 +481,16 @@ func writeErr(w io.Writer, msg string) {
 	_ = json.NewEncoder(w).Encode(Response{Error: msg})
 }
 
+func serverConnDeadline() time.Duration {
+	sendTimeout := durationFromEnvMillis("EXPLAIN_SEND_TIMEOUT_MS", defaultSendDeadline)
+	llmTimeout := durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout)
+	minRequired := llmTimeout + time.Second
+	if sendTimeout > minRequired {
+		return sendTimeout
+	}
+	return minRequired
+}
+
 // explain runs heuristics and optionally an LLM call.
 func explain(req Request) (string, bool, error) {
 	heur := heuristic(req)
@@ -357,9 +515,12 @@ func explain(req Request) (string, bool, error) {
 		return heur.Message, false, nil
 	}
 
-	llmMsg, err := callLLM(key, req, heur)
+	llmMsg, err := llmCaller(key, req, heur)
 	if err != nil {
-		return heur.Message + " (LLM error: " + err.Error() + ")", false, err
+		if isTruthy(os.Getenv("EXPLAIN_DEBUG")) {
+			fmt.Fprintf(os.Stderr, "[explainerr] LLM call failed: %v\n", err)
+		}
+		return heur.Message, false, nil
 	}
 	if isLowValueLLMMessage(llmMsg) {
 		return heur.Message, false, nil
@@ -411,8 +572,19 @@ func hasCommandToken(command, token string) bool {
 
 func runtimeConfigHash() string {
 	h := sha256.New()
-	parts := []string{
+	parts := runtimeConfigParts(responsesInstructions)
+	for _, part := range parts {
+		_, _ = io.WriteString(h, part)
+		_, _ = io.WriteString(h, "\n")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func runtimeConfigParts(instructions string) []string {
+	return []string{
 		"version=" + runtimeConfigVersion,
+		"prompt_schema_version=" + promptSchemaVersion,
+		"instructions_sha256=" + textHash(instructions),
 		"openai_api_key=" + os.Getenv("OPENAI_API_KEY"),
 		"force_llm=" + os.Getenv("EXPLAIN_FORCE_LLM"),
 		"mock_llm=" + os.Getenv("EXPLAIN_MOCK_LLM"),
@@ -421,11 +593,11 @@ func runtimeConfigHash() string {
 		"llm_min_interval_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_MIN_INTERVAL_MS", defaultLLMMinInterval).Milliseconds(), 10),
 		"llm_cache_ttl_ms=" + strconv.FormatInt(durationFromEnvMillis("EXPLAIN_LLM_CACHE_TTL_MS", defaultLLMCacheTTL).Milliseconds(), 10),
 	}
-	for _, part := range parts {
-		_, _ = io.WriteString(h, part)
-		_, _ = io.WriteString(h, "\n")
-	}
-	return hex.EncodeToString(h.Sum(nil))
+}
+
+func textHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func effectiveModel() string {
@@ -443,6 +615,16 @@ func llmCacheKey(req Request) string {
 	_, _ = io.WriteString(h, strings.TrimSpace(req.Command))
 	_, _ = io.WriteString(h, "\n")
 	_, _ = io.WriteString(h, truncate(strings.TrimSpace(req.StdErr), 4096))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strings.TrimSpace(req.OS))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strings.TrimSpace(req.Distro))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strconv.FormatBool(req.InRepo))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strconv.FormatBool(req.InVenv))
+	_, _ = io.WriteString(h, "\n")
+	_, _ = io.WriteString(h, strconv.FormatBool(req.InContainer))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -588,14 +770,16 @@ func callLLM(apiKey string, req Request, heur heuristicResult) (string, error) {
 	prompt := buildPrompt(safeReq, heur)
 
 	if isTruthy(os.Getenv("EXPLAIN_DEBUG")) {
+		fmt.Fprintf(os.Stderr, "[explainerr] LLM instructions sha256: %s\n", textHash(responsesInstructions))
 		fmt.Fprintf(os.Stderr, "[explainerr] LLM prompt:\n%s\n", prompt)
 	}
 
 	payload := responsesRequest{
 		Model:           effectiveModel(),
+		Instructions:    responsesInstructions,
 		Input:           prompt,
-		MaxOutputTokens: 120,
-		Temperature:     0.2,
+		MaxOutputTokens: 90,
+		Temperature:     0.0,
 	}
 
 	b, err := json.Marshal(payload)
@@ -684,24 +868,53 @@ func extractResponseText(resp responsesResponse) string {
 }
 
 func buildPrompt(req Request, heur heuristicResult) string {
-	var b strings.Builder
-	b.WriteString("Given the following terminal command and its output/error message, identify the most likely cause in one short sentence and suggest the most relevant next action or corrected command (e.g., fix a typo, install a missing package, adjust PATH/permissions, use the right flags, or run from the correct directory).\n")
-	b.WriteString("Keep it generic and actionable, and format the response like: '<command>' ... <brief diagnosis>. Did you mean ...?/Try ...\n")
-	b.WriteString("Return only that format in one line.\n")
-	b.WriteString(fmt.Sprintf("Command: %s\n", strings.TrimSpace(req.Command)))
-	b.WriteString(fmt.Sprintf("Exit code: %d\n", req.ExitCode))
-	if req.Cwd != "" {
-		b.WriteString(fmt.Sprintf("CWD: %s\n", filepath.Base(req.Cwd)))
+	outputErr := strings.TrimSpace(truncate(req.StdErr, 1200))
+	if outputErr == "" {
+		outputErr = "<empty>"
 	}
-	if req.StdErr != "" {
-		b.WriteString("Output/error:\n" + truncate(req.StdErr, 800) + "\n")
-	} else {
-		b.WriteString("Output/error: <empty>\n")
+
+	payload := map[string]any{
+		"command":      strings.TrimSpace(req.Command),
+		"exit_code":    req.ExitCode,
+		"cwd":          cwdTail(req.Cwd, 2),
+		"output_error": outputErr,
+		"environment": map[string]any{
+			"os":               strings.TrimSpace(req.OS),
+			"distro":           strings.TrimSpace(req.Distro),
+			"shell":            strings.TrimSpace(req.Shell),
+			"in_repo":          req.InRepo,
+			"in_venv":          req.InVenv,
+			"in_container":     req.InContainer,
+			"path_entries":     req.PathEntries,
+			"path_has_usr_bin": req.PathHasUsrBin,
+		},
 	}
 	if heur.Message != "" {
-		b.WriteString(fmt.Sprintf("Heuristic hint: %s\n", heur.Message))
+		payload["heuristic_hint"] = strings.TrimSpace(heur.Message)
 	}
-	return b.String()
+
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Sprintf("INPUT_JSON:\n{\"command\":%q,\"exit_code\":%d}", strings.TrimSpace(req.Command), req.ExitCode)
+	}
+	return "INPUT_JSON:\n" + string(b)
+}
+
+func cwdTail(path string, elems int) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if elems < 1 {
+		elems = 1
+	}
+
+	clean := filepath.Clean(path)
+	parts := strings.Split(clean, string(filepath.Separator))
+	if len(parts) <= elems {
+		return clean
+	}
+	return strings.Join(parts[len(parts)-elems:], string(filepath.Separator))
 }
 
 func isLowValueLLMMessage(msg string) bool {

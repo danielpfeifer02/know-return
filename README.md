@@ -64,7 +64,7 @@ Environment knobs (override before sourcing):
 - `EXPLAIN_IDLE_MINUTES` daemon idle shutdown (default 30).
 - `EXPLAIN_FORCE_LLM` set to `1/true/on/yes` to always use the LLM (requires `OPENAI_API_KEY`).
 - `EXPLAIN_COLOR` disable color by setting `0/false/off/no` (default is green output).
-- `EXPLAIN_DEBUG` set to `1/true/on/yes` to log daemon requests/prompts; daemon logs to `${EXPLAIN_DAEMON_LOG:-/tmp/explainerr-daemon.log}`.
+- `EXPLAIN_DEBUG` set to `1/true/on/yes` to log daemon requests/prompts (and the instructions hash); daemon logs to `${EXPLAIN_DAEMON_LOG:-/tmp/explainerr-daemon.log}`.
 - `EXPLAIN_MOCK_LLM` set to `1/true/on/yes` to bypass real API calls and return a concise synthetic explanation (handy when offline).
 - `EXPLAIN_MODEL` OpenAI model for LLM fallback (default `gpt-4o-mini`).
 - `EXPLAIN_LLM_TIMEOUT_MS` LLM HTTP timeout in milliseconds (default 4000).
@@ -77,10 +77,13 @@ Environment knobs (override before sourcing):
 
 Set `OPENAI_API_KEY` in your env to let the daemon use the LLM fallback. Without it, heuristics-only messages are shown.
 
-LLM requests use the OpenAI Responses API (`POST /v1/responses`).
+LLM requests use the OpenAI Responses API (`POST /v1/responses`) with stable `instructions` and a structured per-request JSON input blob.
 By default, non-zero exits are sent to the LLM unless the command output already appears self-explanatory (for example usage/help text).
 Prompt input is redacted before LLM calls to mask common secrets (tokens, API keys, URL credentials).
+Structured input includes command/exit/cwd/output plus compact runtime metadata (OS, distro, shell, repo/venv/container flags, and PATH summary).
 If daemon LLM config changes between shells (e.g. model/API key), the next request automatically rotates to a new daemon.
+Prompt instruction changes are part of daemon/client config hashing, so stale daemons are rotated automatically on the next failed command.
+When the OpenAI call fails, explainerr now returns heuristic fallback output instead of failing the send path.
 
 ## CLI usage
 
