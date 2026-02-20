@@ -685,22 +685,22 @@ func extractResponseText(resp responsesResponse) string {
 
 func buildPrompt(req Request, heur heuristicResult) string {
 	var b strings.Builder
-	b.WriteString("Return EXACTLY one sentence in this format: <specific cause>; <direct fix>.\\n")
-	b.WriteString("Be concrete and cite at least one token from command/stderr (flag, filename, subcommand, or error text).\\n")
-	b.WriteString("Do NOT use generic phrases like 'non-zero exit code', 'ensure the command is valid', or 'make sure it does not fail'.\\n")
-	b.WriteString(fmt.Sprintf("Command: %s\\n", strings.TrimSpace(req.Command)))
-	b.WriteString(fmt.Sprintf("Exit code: %d\\n", req.ExitCode))
+	b.WriteString("Given the following terminal command and its output/error message, identify the most likely cause in one short sentence and suggest the most relevant next action or corrected command (e.g., fix a typo, install a missing package, adjust PATH/permissions, use the right flags, or run from the correct directory).\n")
+	b.WriteString("Keep it generic and actionable, and format the response like: '<command>' ... <brief diagnosis>. Did you mean ...?/Try ...\n")
+	b.WriteString("Return only that format in one line.\n")
+	b.WriteString(fmt.Sprintf("Command: %s\n", strings.TrimSpace(req.Command)))
+	b.WriteString(fmt.Sprintf("Exit code: %d\n", req.ExitCode))
 	if req.Cwd != "" {
-		b.WriteString(fmt.Sprintf("CWD: %s\\n", filepath.Base(req.Cwd)))
+		b.WriteString(fmt.Sprintf("CWD: %s\n", filepath.Base(req.Cwd)))
 	}
 	if req.StdErr != "" {
-		b.WriteString("Stderr tail:\n" + truncate(req.StdErr, 800) + "\n")
+		b.WriteString("Output/error:\n" + truncate(req.StdErr, 800) + "\n")
 	} else {
-		b.WriteString("Stderr tail: <empty>\n")
-		b.WriteString("If stderr is empty, infer from command semantics and exit code, then suggest one concrete rerun step.\n")
+		b.WriteString("Output/error: <empty>\n")
 	}
-	b.WriteString(fmt.Sprintf("Heuristic guess: %s\n", heur.Message))
-	b.WriteString("Respond with one concise sentence only.\\n")
+	if heur.Message != "" {
+		b.WriteString(fmt.Sprintf("Heuristic hint: %s\n", heur.Message))
+	}
 	return b.String()
 }
 
