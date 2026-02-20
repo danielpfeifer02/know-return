@@ -55,6 +55,8 @@ Environment knobs (override before sourcing):
 - `EXPLAIN_DEBUG` set to `1/true/on/yes` to log daemon requests/prompts; daemon logs to `${EXPLAIN_DAEMON_LOG:-/tmp/explainerr-daemon.log}`.
 - `EXPLAIN_MOCK_LLM` set to `1/true/on/yes` to bypass real API calls and return a concise synthetic explanation (handy when offline).
 - `EXPLAIN_MODEL` OpenAI model for LLM fallback (default `gpt-4o-mini`).
+- `EXPLAIN_LLM_TIMEOUT_MS` LLM HTTP timeout in milliseconds (default 4000).
+- `EXPLAIN_SEND_TIMEOUT_MS` client socket wait timeout in milliseconds (default 6000).
 - `EXPLAIN_SHELL` override shell detection in `scripts/explain_init.sh` (`bash` or `zsh`).
 
 ## OpenAI
@@ -62,6 +64,7 @@ Environment knobs (override before sourcing):
 Set `OPENAI_API_KEY` in your env to let the daemon use the LLM fallback. Without it, heuristics-only messages are shown.
 
 LLM requests use the OpenAI Responses API (`POST /v1/responses`).
+By default, non-zero exits are sent to the LLM unless the command output already appears self-explanatory (for example usage/help text).
 
 ## CLI usage
 

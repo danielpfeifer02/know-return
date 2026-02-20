@@ -34,8 +34,10 @@ if not test -S "$EXPLAIN_SOCK"
             set daemon_log "$EXPLAIN_DAEMON_LOG"
         end
         env EXPLAIN_DEBUG=1 "$explain_bin" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >"$daemon_log" 2>&1 &
+        disown $last_pid 2>/dev/null
     else
         "$explain_bin" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >/dev/null 2>&1 &
+        disown $last_pid 2>/dev/null
     end
     for _i in (seq 1 20)
         if test -S "$EXPLAIN_SOCK"

@@ -62,3 +62,65 @@ func TestExtractResponseTextFromOutputItems(t *testing.T) {
 		t.Fatalf("extractResponseText = %q, want %q", got, "first second")
 	}
 }
+
+func TestHeuristicFalseCommand(t *testing.T) {
+	got := heuristic(Request{Command: "false", ExitCode: 1})
+	if got.Confidence < 0.9 {
+		t.Fatalf("heuristic confidence = %v, want >= 0.9", got.Confidence)
+	}
+	if got.Message == "" || got.Message == "Command failed (exit 1)." {
+		t.Fatalf("heuristic message too generic: %q", got.Message)
+	}
+}
+
+func TestIsLowValueLLMMessage(t *testing.T) {
+	if !isLowValueLLMMessage("The command failed because it returned a non-zero exit code.") {
+		t.Fatal("expected generic response to be marked low-value")
+	}
+	if isLowValueLLMMessage("`grep -l` was run without a pattern; provide a pattern like `grep -l foo file.txt`.") {
+		t.Fatal("expected concrete response to be accepted")
+	}
+}
+
+func TestShouldUseLLMForNonZeroWithNoOutput(t *testing.T) {
+	req := Request{
+		Command:  `grep --color=auto -rl "THIS SHALL NOT BE FOUND"`,
+		ExitCode: 1,
+		StdErr:   "",
+	}
+	if !shouldUseLLM(req, false) {
+		t.Fatal("expected non-zero/no-output case to use LLM")
+	}
+}
+
+func TestShouldUseLLMFalseForUsageOutput(t *testing.T) {
+	req := Request{
+		Command:  `grep -l`,
+		ExitCode: 2,
+		StdErr:   "usage: grep [OPTION]... PATTERNS [FILE]...\nTry 'grep --help' for more information.",
+	}
+	if shouldUseLLM(req, false) {
+		t.Fatal("expected usage output case to skip LLM")
+	}
+}
+
+func TestShouldUseLLMFalseForHelpCommand(t *testing.T) {
+	req := Request{
+		Command:  `grep --help`,
+		ExitCode: 2,
+	}
+	if shouldUseLLM(req, false) {
+		t.Fatal("expected --help command to skip LLM")
+	}
+}
+
+func TestShouldUseLLMForceOverride(t *testing.T) {
+	req := Request{
+		Command:  `grep --help`,
+		ExitCode: 2,
+		StdErr:   "usage: grep ...",
+	}
+	if !shouldUseLLM(req, true) {
+		t.Fatal("expected force mode to use LLM")
+	}
+}

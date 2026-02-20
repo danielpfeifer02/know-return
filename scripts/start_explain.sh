@@ -34,12 +34,16 @@ if [[ -e "$__explain_sock" && ! -S "$__explain_sock" ]]; then
 fi
 
 if [[ ! -S "$__explain_sock" ]]; then
+  __explain_pid=""
   if [[ "${EXPLAIN_DEBUG:-}" =~ ^([Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]|1)$ ]]; then
     __explain_log="${EXPLAIN_DAEMON_LOG:-/tmp/explainerr-daemon.log}"
     EXPLAIN_DEBUG=1 "$__explain_bin" serve -socket "$__explain_sock" -idle-minutes "$__explain_idle" >"$__explain_log" 2>&1 &
+    __explain_pid=$!
   else
     "$__explain_bin" serve -socket "$__explain_sock" -idle-minutes "$__explain_idle" >/dev/null 2>&1 &
+    __explain_pid=$!
   fi
+  disown "$__explain_pid" 2>/dev/null || true
   for _i in {1..20}; do
     [[ -S "$__explain_sock" ]] && break
     sleep 0.05

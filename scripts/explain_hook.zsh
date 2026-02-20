@@ -39,13 +39,17 @@ explain_maybe_start_daemon() {
     return 0
   fi
 
+  local daemon_pid
   if explain_is_truthy "${EXPLAIN_DEBUG:-}"; then
     local log_file="${EXPLAIN_DAEMON_LOG:-/tmp/explainerr-daemon.log}"
     echo "[explainerr] starting daemon with debug; logs at $log_file" >&2
     EXPLAIN_DEBUG=1 "$EXPLAIN_BIN" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >"$log_file" 2>&1 &
+    daemon_pid=$!
   else
     "$EXPLAIN_BIN" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >/dev/null 2>&1 &
+    daemon_pid=$!
   fi
+  disown "$daemon_pid" 2>/dev/null || true
 
   explain_wait_for_socket
 }

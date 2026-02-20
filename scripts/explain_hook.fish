@@ -53,8 +53,10 @@ function __explain_maybe_start_daemon
         end
         echo "[explainerr] starting daemon with debug; logs at $log_file" >&2
         env EXPLAIN_DEBUG=1 "$EXPLAIN_BIN" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >"$log_file" 2>&1 &
+        disown $last_pid 2>/dev/null
     else
         "$EXPLAIN_BIN" serve -socket "$EXPLAIN_SOCK" -idle-minutes "$EXPLAIN_IDLE_MINUTES" >/dev/null 2>&1 &
+        disown $last_pid 2>/dev/null
     end
 
     __explain_wait_for_socket

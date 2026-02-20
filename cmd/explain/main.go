@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,6 +39,8 @@ type Response struct {
 
 const defaultSocket = "/tmp/explainerr.sock"
 const defaultModel = "gpt-4o-mini"
+const defaultSendDeadline = 6 * time.Second
+const defaultLLMTimeout = 4 * time.Second
 
 func main() {
 	if len(os.Args) < 2 {
@@ -230,7 +233,7 @@ func sendRequest(socket string, req Request) (*Response, error) {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
 	defer c.Close()
-	if err := c.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	if err := c.SetDeadline(time.Now().Add(durationFromEnvMillis("EXPLAIN_SEND_TIMEOUT_MS", defaultSendDeadline))); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
@@ -282,12 +285,7 @@ func explain(req Request) (string, bool, error) {
 	key := os.Getenv("OPENAI_API_KEY")
 	forceLLM := isTruthy(os.Getenv("EXPLAIN_FORCE_LLM"))
 
-	if heur.Confidence >= 0.7 && !forceLLM {
-		return heur.Message, false, nil
-	}
-
-	// For usage errors we keep output concise and skip LLM even if forced.
-	if heur.Confidence >= 0.85 && strings.HasPrefix(heur.Message, "Usage error:") {
+	if !shouldUseLLM(req, forceLLM) {
 		return heur.Message, false, nil
 	}
 
@@ -300,7 +298,42 @@ func explain(req Request) (string, bool, error) {
 	if err != nil {
 		return heur.Message + " (LLM error: " + err.Error() + ")", false, err
 	}
+	if isLowValueLLMMessage(llmMsg) {
+		return heur.Message, false, nil
+	}
 	return llmMsg, true, nil
+}
+
+func shouldUseLLM(req Request, forceLLM bool) bool {
+	if forceLLM {
+		return true
+	}
+	if req.ExitCode == 0 {
+		return false
+	}
+	return !isSelfExplainedByOutput(req)
+}
+
+func isSelfExplainedByOutput(req Request) bool {
+	cmd := " " + strings.ToLower(strings.TrimSpace(req.Command)) + " "
+	if strings.Contains(cmd, " --help ") || strings.Contains(cmd, " -h ") {
+		return true
+	}
+
+	stderr := strings.ToLower(strings.TrimSpace(req.StdErr))
+	if stderr == "" {
+		return false
+	}
+	if strings.Contains(stderr, "usage:") {
+		return true
+	}
+	if strings.Contains(stderr, "--help") || strings.Contains(stderr, "for help") {
+		return true
+	}
+	if strings.Contains(stderr, "try '") || strings.Contains(stderr, "try \"") {
+		return true
+	}
+	return false
 }
 
 type heuristicResult struct {
@@ -313,8 +346,13 @@ func heuristic(req Request) heuristicResult {
 	msg := fmt.Sprintf("Command failed (exit %d).", req.ExitCode)
 	conf := 0.2
 
+	cmdLine := strings.TrimSpace(req.Command)
+	cmdLower := strings.ToLower(cmdLine)
 	stderr := strings.ToLower(req.StdErr)
 
+	if cmdLower == "false" {
+		return heuristicResult{Message: "The `false` command always exits with status 1; replace it with the real command you intended or `true` if this was a test.", Confidence: 0.95}
+	}
 	if req.ExitCode == 127 || strings.Contains(stderr, "command not found") {
 		return heuristicResult{Message: "Command not found: check PATH or install the binary.", Confidence: 0.9}
 	}
@@ -341,6 +379,12 @@ func heuristic(req Request) heuristicResult {
 	}
 	if req.ExitCode == 2 && (strings.Contains(stderr, "usage:") || strings.Contains(stderr, "try '") || strings.Contains(stderr, "try \"")) {
 		return heuristicResult{Message: "Usage error: the command arguments are invalid or incomplete. Re-run with required args or --help.", Confidence: 0.85}
+	}
+	if req.ExitCode == 1 && strings.TrimSpace(req.StdErr) == "" && cmdLine != "" {
+		return heuristicResult{
+			Message:    fmt.Sprintf("`%s` exited with status 1 and no stderr; rerun with verbose/debug flags or inspect command-specific logs.", truncate(cmdLine, 80)),
+			Confidence: 0.72,
+		}
 	}
 
 	// Generic exit code hints
@@ -397,7 +441,7 @@ func callLLM(apiKey string, req Request, heur heuristicResult) (string, error) {
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), durationFromEnvMillis("EXPLAIN_LLM_TIMEOUT_MS", defaultLLMTimeout))
 	defer cancel()
 
 	reqHTTP, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/responses", strings.NewReader(string(b)))
@@ -430,6 +474,19 @@ func callLLM(apiKey string, req Request, heur heuristicResult) (string, error) {
 	return msg, nil
 }
 
+func durationFromEnvMillis(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 200 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func extractResponseText(resp responsesResponse) string {
 	if msg := strings.TrimSpace(resp.OutputText); msg != "" {
 		return msg
@@ -452,7 +509,9 @@ func extractResponseText(resp responsesResponse) string {
 
 func buildPrompt(req Request, heur heuristicResult) string {
 	var b strings.Builder
-	b.WriteString("In ONE short sentence, explain why the shell command failed and the most direct fix. No bullets.\\n")
+	b.WriteString("Return EXACTLY one sentence in this format: <specific cause>; <direct fix>.\\n")
+	b.WriteString("Be concrete and cite at least one token from command/stderr (flag, filename, subcommand, or error text).\\n")
+	b.WriteString("Do NOT use generic phrases like 'non-zero exit code', 'ensure the command is valid', or 'make sure it does not fail'.\\n")
 	b.WriteString(fmt.Sprintf("Command: %s\\n", strings.TrimSpace(req.Command)))
 	b.WriteString(fmt.Sprintf("Exit code: %d\\n", req.ExitCode))
 	if req.Cwd != "" {
@@ -460,10 +519,33 @@ func buildPrompt(req Request, heur heuristicResult) string {
 	}
 	if req.StdErr != "" {
 		b.WriteString("Stderr tail:\n" + truncate(req.StdErr, 800) + "\n")
+	} else {
+		b.WriteString("Stderr tail: <empty>\n")
+		b.WriteString("If stderr is empty, infer from command semantics and exit code, then suggest one concrete rerun step.\n")
 	}
 	b.WriteString(fmt.Sprintf("Heuristic guess: %s\n", heur.Message))
-	b.WriteString("Respond with one concise sentence.\\n")
+	b.WriteString("Respond with one concise sentence only.\\n")
 	return b.String()
+}
+
+func isLowValueLLMMessage(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	if m == "" {
+		return true
+	}
+	if strings.Contains(m, "non-zero exit code") || strings.Contains(m, "returned a non-zero") {
+		return true
+	}
+	if strings.HasPrefix(m, "the command failed because") {
+		return true
+	}
+	if strings.Contains(m, "ensure the command") && strings.Contains(m, "does not fail") {
+		return true
+	}
+	if strings.Contains(m, "make sure") && strings.Contains(m, "does not fail") {
+		return true
+	}
+	return false
 }
 
 func truncate(s string, max int) string {
